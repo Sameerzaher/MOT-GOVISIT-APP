@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, json, contextlib, traceback, logging, requests
+import os, time, json, contextlib, traceback, logging, requests, re
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -10,14 +10,19 @@ from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException
 
 # =================== Config ===================
-OTP_API     = os.getenv("OTP_API", "http://localhost:8000")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
+OTP_API     = os.getenv("OTP_API", "https://mot-govisit-app.onrender.com")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "MyStrongAdminToken")
 GOV_URL     = os.getenv("GOV_URL", "https://govisit.gov.il/he/app/appointment/29/1870/info")
 HEADERS     = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 CHROME_BIN        = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 HEADLESS_DEFAULT  = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
+
+# Slots logging flags
+SLOTS_SCAN      = os.getenv("SLOTS_SCAN", "1").lower() in ("1", "true", "yes")
+SLOTS_DEEP      = os.getenv("SLOTS_DEEP", "0").lower() in ("1", "true", "yes")
+SLOTS_MAX_DAYS  = int(os.getenv("SLOTS_MAX_DAYS", "10"))
 
 # =================== Logging ===================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -110,7 +115,7 @@ def build_driver(headless: bool):
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(60)
 
-    # stealth tweaks
+    # simple stealth
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         window.chrome = window.chrome || { runtime: {} };
@@ -237,27 +242,9 @@ def fill_phone_and_send_sms(wait: WebDriverWait, phone: str) -> bool:
             continue
     return False
 
-def enter_otp(wait: WebDriverWait, otp: str, timeout: int = 45) -> bool:
-    """
-    מזין OTP – מכסה:
-    - שדה יחיד (text/password/tel) עם one-time-code / code / aria-label/placeholder 'קוד' / inputmode=numeric
-    - תיבות מרובות (maxlength=1)
-    תמיד יוצא מה-iframe לפני חיפוש.
-    """
-    d = wait._driver
-    with contextlib.suppress(Exception):
-        d.switch_to.default_content()
-
-    def visible_first(css: str):
-        try:
-            els = d.find_elements(By.CSS_SELECTOR, css)
-            els = [e for e in els if e.is_displayed() and e.is_enabled()]
-            return els[0] if els else None
-        except Exception:
-            return None
-
-    end = time.time() + timeout
-    single_css_list = [
+# ===== OTP helpers =====
+def find_otp_input(driver):
+    sels = [
         "input[autocomplete='one-time-code']",
         "input[name*='code' i]",
         "input[id*='code' i]",
@@ -268,61 +255,58 @@ def enter_otp(wait: WebDriverWait, otp: str, timeout: int = 45) -> bool:
         "input[type='password']",
         "input[type='text']",
     ]
-
-    while time.time() < end:
-        # נסה שדה יחיד (בכמה selectors)
-        for sel in single_css_list:
-            el = visible_first(sel)
-            if el:
-                try:
-                    d.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                except Exception:
-                    pass
-                try:
-                    el.clear()
-                except Exception:
-                    pass
-                try:
-                    el.click()
-                except Exception:
-                    d.execute_script("arguments[0].click();", el)
-                for ch in str(otp):
-                    el.send_keys(ch)
-                    time.sleep(0.02)
-                # טריגר אירועי input/change למקרי React
-                with contextlib.suppress(Exception):
-                    d.execute_script(
-                        "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
-                        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
-                        el
-                    )
-                return True
-
-        # נסה לפי label 'קוד'
+    for sel in sels:
         try:
-            el = d.find_element(By.XPATH, "//label[contains(normalize-space(.),'קוד')]/following::input[1]")
-            if el and el.is_displayed():
-                el.clear()
-                el.send_keys(str(otp))
-                return True
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            els = [e for e in els if e.is_displayed() and e.is_enabled()]
+            if els:
+                return els[0]
         except Exception:
             pass
+    return None
 
-        # נסה קוביות מרובות (maxlength=1 או aria-label לספרה)
+def enter_otp(wait: WebDriverWait, otp: str, timeout: int = 45) -> bool:
+    """
+    הזנת OTP – תומך בשדה יחיד או בקוביות (maxlength=1) ומדליק אירועי input/change.
+    """
+    d = wait._driver
+    with contextlib.suppress(Exception):
+        d.switch_to.default_content()
+
+    end = time.time() + timeout
+    while time.time() < end:
+        el = find_otp_input(d)
+        if el:
+            try:
+                d.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                el.clear()
+            with contextlib.suppress(Exception):
+                el.click()
+            for ch in str(otp):
+                el.send_keys(ch)
+                time.sleep(0.02)
+            with contextlib.suppress(Exception):
+                d.execute_script(
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                    el
+                )
+            return True
+
+        # נסיון לקוביות (תיבה לכל ספרה)
         try:
             boxes = d.find_elements(By.CSS_SELECTOR,
                 "input[maxlength='1'], input[aria-label*='ספרה'], input[aria-label*='digit']")
             boxes = [b for b in boxes if b.is_displayed() and b.is_enabled()]
             if boxes and len(boxes) >= len(str(otp)):
-                try:
+                with contextlib.suppress(Exception):
                     d.execute_script("arguments[0].scrollIntoView({block:'center'});", boxes[0])
-                except Exception:
-                    pass
                 for i, ch in enumerate(str(otp)):
-                    try:
+                    with contextlib.suppress(Exception):
                         boxes[i].clear()
-                    except Exception:
-                        pass
                     boxes[i].send_keys(ch)
                     time.sleep(0.02)
                 return True
@@ -334,35 +318,89 @@ def enter_otp(wait: WebDriverWait, otp: str, timeout: int = 45) -> bool:
     return False
 
 def click_login_after_otp(wait: WebDriverWait) -> bool:
-    labels = ["התחברות", "אישור", "כניסה", "המשך"]
+    """
+    לוחץ על "התחברות" גם אם הכפתור מנוטרל: מסיר disabled/aria-disabled, מפעיל requestSubmit,
+    נופל לפקודת ENTER משדה ה-OTP אם צריך.
+    """
     driver = wait._driver
-    for t in labels:
+    labels_he = ["התחברות", "אישור", "כניסה", "המשך"]
+    labels_en = ["Submit", "Continue", "Next", "Sign in", "Log in"]
+
+    def try_click(el):
         try:
-            btn = driver.find_element(By.XPATH, f"//button[contains(normalize-space(.),'{t}')]")
-            if btn.is_displayed():
-                try:
-                    btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", btn)
-                return True
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         except Exception:
             pass
-    try:
-        driver.execute_script("""
-            const bts=[...document.querySelectorAll('button,[role=button],input[type=submit]')];
-            for(const b of bts){const t=(b.innerText||b.textContent||'').trim();
-              if(['התחברות','אישור','כניסה','המשך','Submit','Continue','Next'].some(x=>t.includes(x))){
-                const f=b.closest('form'); if(f){ if(f.requestSubmit) f.requestSubmit(b); else f.submit(); return true; }
-              }
-            } return false;
-        """)
-        return True
-    except Exception:
+        # לבטל נטרול
+        with contextlib.suppress(Exception):
+            driver.execute_script(
+                "arguments[0].removeAttribute('disabled');"
+                "arguments[0].setAttribute('aria-disabled','false');"
+                "arguments[0].classList && arguments[0].classList.remove('disabled');",
+                el
+            )
+        try:
+            el.click()
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                driver.execute_script("arguments[0].click();", el)
+                return True
         return False
+
+    # 1) לפי טקסט בעברית/אנגלית
+    for txt in labels_he + labels_en:
+        try:
+            btns = driver.find_elements(By.XPATH, f"//button[contains(normalize-space(.),'{txt}')]")
+            btns += driver.find_elements(By.XPATH, f"//*[self::button or self::a][contains(normalize-space(.),'{txt}')]")
+            for b in btns:
+                if b.is_displayed():
+                    if try_click(b):
+                        return True
+        except Exception:
+            pass
+
+    # 2) כל submit זמין
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit']"):
+            if el.is_displayed():
+                if try_click(el):
+                    return True
+    except Exception:
+        pass
+
+    # 3) בקשה ישירה ל-submit של הטופס
+    try:
+        ok = driver.execute_script("""
+            const forms=[...document.querySelectorAll('form')];
+            for(const f of forms){
+                try{
+                    const btn=f.querySelector('button,[type=submit]');
+                    if(btn){ btn.removeAttribute('disabled'); btn.setAttribute('aria-disabled','false'); }
+                    if(f.requestSubmit){ f.requestSubmit(btn||undefined); }
+                    else { f.submit(); }
+                    return true;
+                }catch(e){}
+            }
+            return false;
+        """)
+        if ok:
+            return True
+    except Exception:
+        pass
+
+    # 4) אנטר מתוך שדה ה-OTP
+    with contextlib.suppress(Exception):
+        el = find_otp_input(driver)
+        if el:
+            el.send_keys(Keys.ENTER)
+            return True
+
+    return False
 
 # ---- ID & Filters helpers ----
 def find_id_input(driver):
-    label_phrases = ["מספר זהות", "תעודת זהות", "ת.ז", "תע''ז"]
+    label_phrases = ["מספר זהות", "תעודת זהות", "ת.ז"]
     for phrase in label_phrases:
         for xp in [
             f"//label[contains(normalize-space(.),'{phrase}')]/following::input[1]",
@@ -452,7 +490,6 @@ def open_custom_select_and_choose(driver, box, wanted: str) -> bool:
     except Exception:
         driver.execute_script("arguments[0].click();", box)
     time.sleep(0.3)
-    # חפש אופציות נפוצות
     option_xps = [
         f"//*[@role='option' and contains(normalize-space(.),'{wanted}')]",
         f"//li[contains(normalize-space(.),'{wanted}')]",
@@ -468,7 +505,6 @@ def open_custom_select_and_choose(driver, box, wanted: str) -> bool:
             return True
         except Exception:
             continue
-    # נסה Enter
     with contextlib.suppress(Exception):
         box.send_keys(wanted)
         time.sleep(0.2)
@@ -489,11 +525,9 @@ def set_select_like(driver, container, wanted: str) -> bool:
                     return True
         except Exception:
             pass
-    # combobox / div-select
     return open_custom_select_and_choose(driver, container, wanted)
 
 def find_labeled_field(driver, label_words, prefer_select=False):
-    # חיפוש לפי לייבל
     for word in label_words:
         for xp in [
             f"//label[contains(normalize-space(.),'{word}')]/following::*[(self::input or self::select or self::*[@role='combobox'])][1]",
@@ -506,7 +540,6 @@ def find_labeled_field(driver, label_words, prefer_select=False):
                         return el
             except Exception:
                 pass
-    # חיפוש טיפוסי
     if prefer_select:
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, "[role='combobox'], select"):
@@ -594,7 +627,7 @@ def fill_filters_and_next(wait: WebDriverWait, payload: dict) -> bool:
 
     # תאריך
     if date_v:
-        fld = find_labeled_field(driver, ["תאריך", "תּאריך", "תאריך"])
+        fld = find_labeled_field(driver, ["תאריך"])
         if not fld:
             try:
                 fld = driver.find_element(By.CSS_SELECTOR, "input[type='date']")
@@ -624,9 +657,6 @@ def fill_filters_and_next(wait: WebDriverWait, payload: dict) -> bool:
 
     if t_to:
         fld = find_labeled_field(driver, ["שעת סיום", "עד שעה"])
-        if not fld:
-            # אם יש רק time input אחד, דלג
-            fld = None
         if fld:
             try:
                 set_text(driver, fld, t_to)
@@ -643,7 +673,125 @@ def fill_filters_and_next(wait: WebDriverWait, payload: dict) -> bool:
             (fld or driver.switch_to.active_element).send_keys(Keys.ENTER)
             return True
 
-    return True  # לא קריטי אם לא מצאנו—נמשיך לזרימה הבאה
+    return True  # לא קריטי אם לא מצאנו—נמשיך
+
+# =================== Slots logging ===================
+TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b")
+
+def _el_text(driver, el):
+    try:
+        t = (el.text or "").strip()
+        if not t:
+            t = (el.get_attribute("textContent") or "").strip()
+        return t
+    except Exception:
+        return ""
+
+def _current_date_label(driver):
+    try:
+        sel = driver.find_elements(
+            By.XPATH,
+            "//button[( @aria-pressed='true' or @aria-selected='true' or contains(@class,'selected') ) and string-length(normalize-space(.))<=2]"
+        )
+        if sel:
+            a = sel[0].get_attribute("aria-label")
+            if a:
+                return a.strip()
+    except Exception:
+        pass
+    try:
+        headers = driver.find_elements(
+            By.XPATH,
+            "//*[self::h1 or self::h2 or self::h3 or self::div][contains(normalize-space(.),'תאריך') or contains(normalize-space(.),'יום') or contains(normalize-space(.),'חודש')]"
+        )
+        for h in headers:
+            txt = _el_text(driver, h)
+            if txt:
+                return txt
+    except Exception:
+        pass
+    return "תאריך לא מזוהה"
+
+def _extract_times_on_page(driver):
+    times = set()
+    try:
+        candidates = driver.find_elements(
+            By.XPATH,
+            "//*[self::button or self::li or self::div or self::span]"
+            "[contains(normalize-space(.),':') and not(@aria-disabled='true') and not(@disabled)]"
+        )
+        for el in candidates:
+            txt = _el_text(driver, el)
+            if not txt:
+                continue
+            for m in TIME_RE.findall(txt):
+                times.add(m)
+    except Exception:
+        pass
+    return sorted(times)
+
+def _click_safely(driver, el):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    except Exception:
+        pass
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+def log_available_slots(wait: WebDriverWait, deep_scan: bool = False, max_days: int = 10):
+    driver = wait._driver
+    with contextlib.suppress(Exception):
+        driver.switch_to.default_content()
+
+    date_label = _current_date_label(driver)
+    times_now = _extract_times_on_page(driver)
+    if times_now:
+        LOGGER.info("SLOTS | %s | %s", date_label, ", ".join(times_now))
+    else:
+        LOGGER.info("SLOTS | %s | אין שעות זמינות כרגע", date_label)
+
+    if not deep_scan:
+        return
+
+    seen_days = set()
+    scanned = 0
+    for _ in range(max_days * 2):
+        if scanned >= max_days:
+            break
+        try:
+            day_buttons = driver.find_elements(
+                By.XPATH,
+                "//button[not(@disabled) and not(@aria-disabled='true') and normalize-space(.)!='' and string-length(normalize-space(.))<=2]"
+            )
+            target = None
+            for db in day_buttons:
+                label = db.get_attribute("aria-label") or _el_text(driver, db)
+                label = (label or "").strip()
+                if not label or label in seen_days:
+                    continue
+                target = db
+                break
+
+            if not target:
+                break
+
+            label = target.get_attribute("aria-label") or _el_text(driver, target)
+            label = (label or "").strip()
+            seen_days.add(label)
+
+            _click_safely(driver, target)
+            time.sleep(0.4)
+
+            times = _extract_times_on_page(driver)
+            if times:
+                LOGGER.info("SLOTS | %s | %s", label or "?", ", ".join(times))
+            else:
+                LOGGER.info("SLOTS | %s | אין שעות", label or "?")
+            scanned += 1
+        except Exception:
+            continue
 
 # =================== Main loop ===================
 def main():
@@ -697,7 +845,11 @@ def main():
                         raise RuntimeError("otp fields not found")
 
                 with step("CLICK login after OTP"):
-                    click_login_after_otp(wait)
+                    clicked = click_login_after_otp(wait)
+                    time.sleep(0.5)
+                    # המתן לניווט מתוך מסך האימות
+                    with contextlib.suppress(Exception):
+                        WebDriverWait(driver, 10).until(lambda d: "auth/verify" not in (d.current_url or ""))
 
                 mark_used(otp_id)
                 mark_login(jid, "done")
@@ -710,6 +862,10 @@ def main():
 
                 with step("FILL filters (city/branch/date/time) and NEXT"):
                     fill_filters_and_next(wait, payload)
+
+                if SLOTS_SCAN:
+                    with step("LIST available slots"):
+                        log_available_slots(wait, deep_scan=SLOTS_DEEP, max_days=SLOTS_MAX_DAYS)
 
                 dump_state(driver, "done")
                 LOGGER.info("[OK] %s", phone)
